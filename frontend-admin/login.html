@@ -57,6 +57,18 @@
       20%, 60% { transform: translateX(-8px); }
       40%, 80% { transform: translateX(8px); }
     }
+    .btn-login:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+    /* 锁定/剩余次数提示（琥珀色，区别于普通错误） */
+    .alert-warn {
+      color: #92400e !important;
+      background: #fffbeb !important;
+      border-color: #fde68a !important;
+    }
   </style>
 </head>
 <body class="login-bg text-slate-600 font-sans antialiased">
@@ -108,11 +120,15 @@
             </div>
           </div>
 
-          <!-- 错误提示 -->
+          <!-- 提示信息（错误 / 剩余次数 / 锁定） -->
           <div id="errorMsg" class="hidden text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
             <span class="iconify inline-block mr-1 align-text-bottom" data-icon="lucide:alert-circle" data-width="16" data-height="16"></span>
             <span id="errorText">用户名或密码错误</span>
           </div>
+
+          <p class="text-xs text-slate-400 text-center -mt-1">
+            连续输错 5 次密码，账号将被锁定 5 分钟
+          </p>
 
           <button 
             type="submit" 
@@ -152,66 +168,154 @@
   var loginBtn = document.getElementById('loginBtn');
   var loginCard = document.querySelector('.login-card');
 
-  // 显示错误信息
-  function showError(msg) {
-    errorText.textContent = msg;
-    errorMsg.classList.remove('hidden');
-    loginCard.classList.add('shake');
-    setTimeout(function () {
-      loginCard.classList.remove('shake');
-    }, 400);
+  var submitting = false;  // 请求进行中，防止重复提交
+  var tickTimer = null;    // 锁定倒计时定时器
+
+  function getUsername() {
+    return usernameInput.value.trim();
   }
 
-  // 隐藏错误信息
-  function hideError() {
-    errorMsg.classList.add('hidden');
+  // 展示提示：type=error 红色错误，type=warn 琥珀色（剩余次数/锁定）
+  function showMessage(msg, type) {
+    errorText.textContent = msg;
+    errorMsg.classList.remove('hidden', 'alert-warn');
+    if (type === 'warn') errorMsg.classList.add('alert-warn');
+    if (type === 'error') {
+      loginCard.classList.add('shake');
+      setTimeout(function () {
+        loginCard.classList.remove('shake');
+      }, 400);
+    }
+  }
+
+  function hideMessage() {
+    errorMsg.classList.add('hidden', 'alert-warn');
+  }
+
+  // 还原登录按钮的可点击样式
+  function resetBtn() {
+    loginBtn.disabled = false;
+    loginBtn.innerHTML = '<span class="iconify" data-icon="lucide:log-in" data-width="18" data-height="18"></span> 登录';
+  }
+
+  // 按当前用户名渲染登录限制状态（锁定/剩余次数），返回是否锁定
+  function renderLoginStatus() {
+    var username = getUsername();
+    var rec = AuthModule.getLoginFailure(username);
+
+    if (rec.lockUntil) {
+      // 锁定：按钮禁用 + 倒计时文案，重复进入登录页同样受限
+      loginBtn.disabled = true;
+      loginBtn.innerHTML = '<span class="iconify" data-icon="lucide:lock" data-width="18" data-height="18"></span> 账号锁定中';
+      showMessage(AuthModule.lockedMessage(username), 'warn');
+      ensureTicker();
+      return true;
+    }
+
+    stopTicker();
+    if (!submitting) resetBtn();
+
+    if (rec.count > 0) {
+      // 达到上限前：持续提示还剩几次机会
+      showMessage(AuthModule.loginStatusMessage(username), 'warn');
+    } else {
+      hideMessage();
+    }
+    return false;
+  }
+
+  function stopTicker() {
+    if (tickTimer) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+  }
+
+  // 每秒刷新倒计时；锁定解除后恢复可提交
+  function ensureTicker() {
+    if (tickTimer) return;
+    tickTimer = setInterval(function () {
+      var username = getUsername();
+      var rec = AuthModule.getLoginFailure(username);
+      if (rec.lockUntil) {
+        showMessage(AuthModule.lockedMessage(username), 'warn');
+        return;
+      }
+      // 锁定已到期：恢复按钮与输入；正在编辑用户名时不抢焦点
+      stopTicker();
+      if (!submitting) resetBtn();
+      hideMessage();
+      if (document.activeElement !== usernameInput) passwordInput.focus();
+    }, 1000);
   }
 
   // 表单提交
   form.addEventListener('submit', function (e) {
     e.preventDefault();
-    hideError();
 
-    var username = usernameInput.value.trim();
+    var username = getUsername();
     var password = passwordInput.value;
 
     if (!username) {
-      showError('请输入用户名');
+      showMessage('请输入用户名', 'error');
       usernameInput.focus();
       return;
     }
-
     if (!password) {
-      showError('请输入密码');
+      showMessage('请输入密码', 'error');
       passwordInput.focus();
       return;
     }
 
+    // UI 层拦截：请求中或锁定中直接忽略重复提交，不能绕过
+    if (submitting) return;
+    if (AuthModule.isLoginLocked(username)) {
+      renderLoginStatus();
+      return;
+    }
+
     // 禁用按钮，显示加载状态
+    submitting = true;
     loginBtn.disabled = true;
     loginBtn.innerHTML = '<span class="iconify animate-spin" data-icon="lucide:loader-2" data-width="18" data-height="18"></span> 登录中...';
 
     // 模拟网络延迟
     setTimeout(function () {
+      // AuthModule.login 内部会再次校验锁定，作为绕过按钮时的最终防线
       var result = AuthModule.login(username, password);
 
       if (result.success) {
-        // 登录成功，跳转到首页
+        // 登录成功（含解除后第一次成功）：失败记录已在 login 内清零
         window.location.href = 'index.html';
-      } else {
-        // 登录失败
-        showError(result.message || '用户名或密码错误');
-        loginBtn.disabled = false;
-        loginBtn.innerHTML = '<span class="iconify" data-icon="lucide:log-in" data-width="18" data-height="18"></span> 登录';
-        passwordInput.value = '';
-        passwordInput.focus();
+        return;
       }
+
+      submitting = false;
+      passwordInput.value = '';
+      renderLoginStatus();
+      if (!AuthModule.isLoginLocked(username)) passwordInput.focus();
     }, 500);
   });
 
-  // 输入时隐藏错误
-  usernameInput.addEventListener('input', hideError);
-  passwordInput.addEventListener('input', hideError);
+  // 切换用户名时按用户名重新渲染该账号的限制状态；输入时清理瞬时校验错误
+  usernameInput.addEventListener('input', renderLoginStatus);
+  passwordInput.addEventListener('input', function () {
+    var rec = AuthModule.getLoginFailure(getUsername());
+    if (!rec.lockUntil && rec.count === 0) hideMessage();
+  });
+
+  // 跨标签页锁定状态同步（如另一个标签页解锁/失败）
+  window.addEventListener('storage', function (e) {
+    if (e.key && e.key.indexOf('loginFailures') !== -1) {
+      renderLoginStatus();
+    }
+  });
+
+  // 进入登录页时还原状态：优先 URL 上的 username（首页/内页跳转携带），其次最近尝试的账号
+  var params = new URLSearchParams(window.location.search);
+  var prefill = params.get('username') || AuthModule.getLastLoginUsername();
+  if (prefill) usernameInput.value = prefill;
+  renderLoginStatus();
 })();
   </script>
 </body>

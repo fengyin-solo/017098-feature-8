@@ -33,7 +33,26 @@
     { username: 'user', password: '123456', name: '管理员' }
   ];
 
+  // 登录失败限制：连续输错达到上限后锁定一段时间（纯前端，按用户名持久化）
+  var MAX_LOGIN_ATTEMPTS = 5;   // 最大连续失败次数
+  var LOCK_DURATION_MS = 5 * 60 * 1000; // 锁定时长：5 分钟
+
+  function normalizeUsername(username) {
+    return String(username == null ? '' : username).trim();
+  }
+
+  function getLoginFailures() {
+    return load('loginFailures', {}) || {};
+  }
+
+  function saveLoginFailures(records) {
+    save('loginFailures', records || {});
+  }
+
   var AuthModule = {
+    MAX_ATTEMPTS: MAX_LOGIN_ATTEMPTS,
+    LOCK_DURATION: LOCK_DURATION_MS,
+
     // 获取用户列表
     getUsers: function () {
       return load('users', defaultUsers);
@@ -46,13 +65,122 @@
       }
     },
 
-    // 验证登录
+    // 记录最近一次尝试登录的用户名（进入登录页时回显并还原限制状态）
+    setLastLoginUsername: function (username) {
+      save('lastLoginUsername', normalizeUsername(username));
+    },
+    getLastLoginUsername: function () {
+      return load('lastLoginUsername', '') || '';
+    },
+
+    // 读取某用户名的登录失败记录；锁定已过期则清零并返回空记录
+    getLoginFailure: function (username) {
+      var name = normalizeUsername(username);
+      var empty = { count: 0, lockUntil: 0, firstFailAt: null, lastFailAt: null };
+      if (!name) return empty;
+      var records = getLoginFailures();
+      var rec = records[name];
+      if (!rec) return empty;
+      if (rec.lockUntil && Date.now() >= rec.lockUntil) {
+        // 锁定期已过，失败次数清零，重新计数
+        delete records[name];
+        saveLoginFailures(records);
+        return empty;
+      }
+      return {
+        count: rec.count || 0,
+        lockUntil: rec.lockUntil || 0,
+        firstFailAt: rec.firstFailAt || null,
+        lastFailAt: rec.lastFailAt || null
+      };
+    },
+
+    // 该用户名当前是否处于锁定状态
+    isLoginLocked: function (username) {
+      return this.getLoginFailure(username).lockUntil > 0;
+    },
+
+    // 记录一次登录失败；达到上限则写入锁定截止时间。返回最新状态
+    recordLoginFailure: function (username) {
+      var name = normalizeUsername(username);
+      var now = Date.now();
+      var records = getLoginFailures();
+      var rec = records[name] || { count: 0, lockUntil: 0, firstFailAt: null, lastFailAt: null };
+      if (rec.lockUntil && now >= rec.lockUntil) {
+        // 锁定已解除，重新开始计数
+        rec = { count: 0, lockUntil: 0, firstFailAt: null, lastFailAt: null };
+      }
+      rec.count = (rec.count || 0) + 1;
+      if (rec.firstFailAt == null) rec.firstFailAt = now;
+      rec.lastFailAt = now;
+      if (rec.count >= MAX_LOGIN_ATTEMPTS) {
+        rec.lockUntil = now + LOCK_DURATION_MS;
+      }
+      records[name] = rec;
+      saveLoginFailures(records);
+      return this.getLoginFailure(name);
+    },
+
+    // 清除某用户名的失败记录（成功登录后清零）
+    clearLoginFailures: function (username) {
+      var name = normalizeUsername(username);
+      if (!name) return;
+      var records = getLoginFailures();
+      if (records[name]) {
+        delete records[name];
+        saveLoginFailures(records);
+      }
+    },
+
+    // 格式化锁定剩余时长，如 4分32秒 / 45秒
+    formatRemaining: function (ms) {
+      var totalSec = Math.max(0, Math.ceil(ms / 1000));
+      var min = Math.floor(totalSec / 60);
+      var sec = totalSec % 60;
+      if (min > 0) return min + '分' + (sec > 0 ? sec + '秒' : '钟');
+      return sec + '秒';
+    },
+
+    // 锁定提示文案（登录页与首页等内页共用，保证一致）
+    lockedMessage: function (username, now) {
+      var rec = this.getLoginFailure(username);
+      var remainMs = rec.lockUntil - (now || Date.now());
+      return '账号已被锁定，请于 ' + this.formatRemaining(remainMs) + '后再试';
+    },
+
+    // 登录前状态文案：锁定返回锁定提示；有失败记录返回剩余次数提示；否则返回空串
+    loginStatusMessage: function (username, now) {
+      var rec = this.getLoginFailure(username);
+      if (rec.lockUntil) return this.lockedMessage(username, now);
+      if (rec.count > 0) {
+        return '用户名或密码错误，还可尝试 ' + (MAX_LOGIN_ATTEMPTS - rec.count) + ' 次';
+      }
+      return '';
+    },
+
+    // 验证登录（锁定期间直接拒绝，防止绕过按钮重复提交）
     login: function (username, password) {
+      var name = normalizeUsername(username);
+      this.setLastLoginUsername(name);
+
+      var failure = this.getLoginFailure(name);
+      if (failure.lockUntil) {
+        return {
+          success: false,
+          locked: true,
+          message: this.lockedMessage(name),
+          remainingAttempts: 0,
+          lockUntil: failure.lockUntil
+        };
+      }
+
       var users = this.getUsers();
       var user = users.find(function (u) {
-        return u.username === username && u.password === password;
+        return u.username === name && u.password === password;
       });
       if (user) {
+        // 登录成功：失败记录清零，解除后第一次成功即清空
+        this.clearLoginFailures(name);
         var session = {
           username: user.username,
           name: user.name,
@@ -61,7 +189,21 @@
         save('session', session);
         return { success: true, user: session };
       }
-      return { success: false, message: '用户名或密码错误' };
+
+      var rec = this.recordLoginFailure(name);
+      var result = {
+        success: false,
+        remainingAttempts: Math.max(0, MAX_LOGIN_ATTEMPTS - rec.count),
+        message: '用户名或密码错误'
+      };
+      if (rec.lockUntil) {
+        result.locked = true;
+        result.lockUntil = rec.lockUntil;
+        result.message = this.lockedMessage(name);
+      } else {
+        result.message = '用户名或密码错误，还可尝试 ' + result.remainingAttempts + ' 次';
+      }
+      return result;
     },
 
     // 登出

@@ -11,7 +11,15 @@
   // 非登录页需要检查登录状态
   if (currentPage !== 'login.html') {
     if (typeof AuthModule !== 'undefined' && !AuthModule.isLoggedIn()) {
-      window.location.href = 'login.html';
+      // 带上最近尝试登录的用户名，登录页据此还原该账号的失败/锁定提示
+      var lastUsername = typeof AuthModule.getLastLoginUsername === 'function'
+        ? AuthModule.getLastLoginUsername()
+        : '';
+      var loginUrl = 'login.html';
+      if (lastUsername) {
+        loginUrl += '?username=' + encodeURIComponent(lastUsername);
+      }
+      window.location.href = loginUrl;
       return;
     }
   }
