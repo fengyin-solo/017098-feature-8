@@ -49,6 +49,12 @@
     .btn-login:active {
       transform: translateY(0);
     }
+    .btn-login:disabled {
+      background: #94a3b8;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
     .shake {
       animation: shake 0.4s ease;
     }
@@ -114,6 +120,13 @@
             <span id="errorText">用户名或密码错误</span>
           </div>
 
+          <!-- 登录限制提示（剩余次数 / 锁定倒计时） -->
+          <div id="loginNotice" class="hidden text-sm rounded-lg px-4 py-3"></div>
+
+          <p class="text-xs text-slate-400 text-center -mt-2">
+            连续输错 <span id="maxAttemptHint">5</span> 次密码将锁定 1 分钟，锁定期间无法提交
+          </p>
+
           <button 
             type="submit" 
             id="loginBtn"
@@ -149,10 +162,18 @@
   var passwordInput = document.getElementById('password');
   var errorMsg = document.getElementById('errorMsg');
   var errorText = document.getElementById('errorText');
+  var noticeEl = document.getElementById('loginNotice');
   var loginBtn = document.getElementById('loginBtn');
   var loginCard = document.querySelector('.login-card');
 
-  // 显示错误信息
+  // 静态规则提示中的次数与 AuthModule 配置保持一致
+  var maxHint = document.getElementById('maxAttemptHint');
+  if (maxHint) maxHint.textContent = AuthModule.MAX_LOGIN_ATTEMPTS;
+
+  var BTN_HTML = '<span class="iconify" data-icon="lucide:log-in" data-width="18" data-height="18"></span> 登录';
+  var LOADING_HTML = '<span class="iconify animate-spin" data-icon="lucide:loader-2" data-width="18" data-height="18"></span> 登录中...';
+
+  // 显示错误信息（凭证错误、输入校验等）
   function showError(msg) {
     errorText.textContent = msg;
     errorMsg.classList.remove('hidden');
@@ -162,18 +183,114 @@
     }, 400);
   }
 
-  // 隐藏错误信息
   function hideError() {
     errorMsg.classList.add('hidden');
+  }
+
+  // 登录限制提示条：type = 'warn'（剩余次数）| 'lock'（锁定倒计时）
+  function showNotice(msg, type) {
+    var styles = type === 'lock'
+      ? 'text-amber-700 bg-amber-50 border border-amber-200'
+      : 'text-red-600 bg-red-50 border border-red-200';
+    var icon = type === 'lock' ? 'lucide:lock' : 'lucide:alert-triangle';
+    noticeEl.className = 'text-sm rounded-lg px-4 py-3 ' + styles;
+    noticeEl.innerHTML =
+      '<span class="iconify inline-block mr-1 align-text-bottom" data-icon="' + icon +
+      '" data-width="16" data-height="16"></span><span class="notice-text"></span>';
+    noticeEl.querySelector('.notice-text').textContent = msg;
+  }
+
+  function hideNotice() {
+    noticeEl.className = 'hidden text-sm rounded-lg px-4 py-3';
+    noticeEl.innerHTML = '';
+  }
+
+  function setLoading(loading) {
+    loginBtn.disabled = loading;
+    loginBtn.innerHTML = loading ? LOADING_HTML : BTN_HTML;
+  }
+
+  // ====================== 锁定状态与倒计时 ======================
+  var countdownTimer = null;
+  var lockedKey = null;
+  var submitting = false; // 请求在途标志，防止重复提交重复计数
+
+  // 按当前用户名渲染锁定/剩余次数状态；返回是否处于锁定
+  function refreshLockState() {
+    var key = usernameInput.value.trim();
+
+    // 正在展示另一用户名的锁定倒计时：当前用户名不匹配时先解除 UI 锁定
+    if (lockedKey && lockedKey !== key) {
+      stopCountdown();
+    }
+
+    var status = AuthModule.getLoginStatus(key);
+
+    if (status.locked) {
+      hideError();
+      startCountdown(key, status.remainMs);
+      return true;
+    }
+
+    // 非锁定但有未清零的失败记录（锁定过期后、首次成功登录前）
+    if (key && (status.failCount > 0 || status.lockExpired)) {
+      showNotice('密码错误次数过多，若再次连续输错 ' +
+        AuthModule.MAX_LOGIN_ATTEMPTS + ' 次将再次锁定账号', 'warn');
+    } else {
+      hideNotice();
+    }
+    loginBtn.disabled = false;
+    loginBtn.innerHTML = BTN_HTML;
+    return false;
+  }
+
+  function startCountdown(key, remainMs) {
+    lockedKey = key;
+    loginBtn.disabled = true;
+    renderCountdown(remainMs);
+    if (countdownTimer) clearInterval(countdownTimer);
+    countdownTimer = setInterval(function () {
+      // 始终以存储中的记录为准，防止倒计时与真实锁定时间漂移
+      var status = AuthModule.getLoginStatus(lockedKey);
+      if (!status.locked) {
+        stopCountdown();
+        // 锁定解除：短暂说明已可重试，随后可正常提交
+        showNotice('锁定已解除，请重新登录', 'warn');
+        return;
+      }
+      renderCountdown(status.remainMs);
+    }, 500);
+  }
+
+  function renderCountdown(remainMs) {
+    var msg = AuthModule.getLockedMessage(remainMs);
+    showNotice(msg, 'lock');
+    loginBtn.innerHTML =
+      '<span class="iconify" data-icon="lucide:lock" data-width="18" data-height="18"></span> ' +
+      AuthModule.formatLockRemain(remainMs) + ' 后可重试';
+  }
+
+  function stopCountdown() {
+    if (countdownTimer) {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    }
+    lockedKey = null;
+    loginBtn.disabled = false;
+    loginBtn.innerHTML = BTN_HTML;
   }
 
   // 表单提交
   form.addEventListener('submit', function (e) {
     e.preventDefault();
     hideError();
+    hideNotice();
 
     var username = usernameInput.value.trim();
     var password = passwordInput.value;
+
+    // 锁定中（按钮禁用期间重复提交）或请求在途：直接拦截
+    if (lockedKey || submitting) return;
 
     if (!username) {
       showError('请输入用户名');
@@ -187,31 +304,59 @@
       return;
     }
 
-    // 禁用按钮，显示加载状态
-    loginBtn.disabled = true;
-    loginBtn.innerHTML = '<span class="iconify animate-spin" data-icon="lucide:loader-2" data-width="18" data-height="18"></span> 登录中...';
+    // 提交前先按用户名查锁定记录：锁定期间重复提交直接拦截，不进入校验
+    var before = AuthModule.getLoginStatus(username);
+    if (before.locked) {
+      startCountdown(username, before.remainMs);
+      return;
+    }
+
+    // 禁用按钮，显示加载状态（模拟请求期间也无法重复点击/重复计数）
+    submitting = true;
+    setLoading(true);
 
     // 模拟网络延迟
     setTimeout(function () {
+      // AuthModule.login 内部再次校验锁定并记录失败，绕过 UI 也无法提交
       var result = AuthModule.login(username, password);
 
       if (result.success) {
-        // 登录成功，跳转到首页
+        // 登录成功（含解除后首次成功，记录已在 AuthModule 中清零），跳转到首页
         window.location.href = 'index.html';
+        return;
+      }
+
+      passwordInput.value = '';
+      submitting = false;
+      setLoading(false);
+
+      if (result.locked) {
+        // 本次失败刚好达到上限：按钮保持禁用并进入倒计时
+        startCountdown(username, result.remainMs);
+        passwordInput.focus();
       } else {
-        // 登录失败
-        showError(result.message || '用户名或密码错误');
-        loginBtn.disabled = false;
-        loginBtn.innerHTML = '<span class="iconify" data-icon="lucide:log-in" data-width="18" data-height="18"></span> 登录';
-        passwordInput.value = '';
+        // 未达上限：错误条中提示还剩几次机会（notice 仅用于锁定/解除提示）
+        showError(result.message);
         passwordInput.focus();
       }
     }, 500);
   });
 
-  // 输入时隐藏错误
-  usernameInput.addEventListener('input', hideError);
+  // 输入用户名时切换到该用户名的限制状态；输入密码时只收起错误提示
+  usernameInput.addEventListener('input', function () {
+    hideError();
+    if (!lockedKey) hideNotice();
+    refreshLockState();
+  });
   passwordInput.addEventListener('input', hideError);
+
+  // ====================== 进入页面即恢复限制状态 ======================
+  // 从首页或内页被登出/拦截跳回、或直接刷新登录页时同样受限
+  (function initState() {
+    var lastUser = StorageUtil.load('lastLoginUsername', '');
+    if (lastUser && !usernameInput.value) usernameInput.value = lastUser;
+    refreshLockState();
+  })();
 })();
   </script>
 </body>
